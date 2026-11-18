@@ -26,13 +26,6 @@ jobs:
           INCLUDE_OFFICETEL: ${{ vars.INCLUDE_OFFICETEL }}
           SKIP_EMPTY: ${{ vars.SKIP_EMPTY }}
         run: python cheongyak_alert.py
-      - name: 실거래가·토허제 소식 전송
-        if: always()
-        env:
-          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python realestate_alert.py
       - name: 이미 알린 목록 저장
         if: always()
         run: |
