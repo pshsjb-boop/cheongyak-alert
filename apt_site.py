@@ -163,9 +163,11 @@ def main():
             print(f"[경고] {name} 토허 내역 조회 실패: {e}", file=sys.stderr)
             permits, perr = None, str(e)[:120]
         recent = [r for r in rows if r["date"] >= cutoff]
+        # 이 구를 처음 제대로 수집한 날은 기준일로만 저장 (전날 수집 실패 시 '신규 폭탄' 방지)
+        gu_base = first_run or not any(k.startswith(lawd) for k in seen)
         for r in recent:
             sid = r["id"] + ("|X" if r["cancel"] else "")
-            r["seen"] = seen.get(sid) or ("base" if first_run else today)
+            r["seen"] = seen.get(sid) or ("base" if gu_base else today)
             new_seen[sid] = r["seen"]
             r["new"] = r["seen"] == today
         recent.sort(key=lambda r: (r["date"], r["price"]), reverse=True)
