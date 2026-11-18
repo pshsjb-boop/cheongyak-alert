@@ -176,6 +176,40 @@ def send_telegram(text, token, chat_id):
         r.raise_for_status()
 
 
+def site_url():
+    if os.getenv("SITE_URL"):
+        return os.environ["SITE_URL"]
+    if os.getenv("GITHUB_REPOSITORY"):
+        owner, repo = os.environ["GITHUB_REPOSITORY"].split("/")
+        return f"https://{owner}.github.io/{repo}/"
+    return ""
+
+
+def save_seoul(seoul, today, seen, first_run):
+    """웹페이지용 서울 청약 데이터 (data/cheongyak_seoul.json)"""
+    out = []
+    for cat, row, schedule in seoul:
+        sch = []
+        for label, bf, ef in schedule:
+            b = parse_date(row.get(bf))
+            if not b:
+                continue
+            e = (parse_date(row.get(ef)) if ef else b) or b
+            sch.append({"label": label, "b": b.isoformat(), "e": e.isoformat()})
+        pub = parse_date(row.get("RCRIT_PBLANC_DE"))
+        out.append({
+            "name": row.get("HOUSE_NM") or "", "cat": cat, "area": area(row) and html.unescape(area(row)),
+            "addr": row.get("HSSPLY_ADRES") or "", "supply": row.get("TOT_SUPLY_HSHLDCO") or "",
+            "url": row.get("PBLANC_URL") or row.get("HMPG_ADRES") or "",
+            "pub": pub.isoformat() if pub else "", "sch": sorted(sch, key=lambda x: x["b"]),
+            "new": (not first_run) and item_key(row) not in seen,
+        })
+    data_dir = Path(__file__).with_name("data")
+    data_dir.mkdir(exist_ok=True)
+    (data_dir / "cheongyak_seoul.json").write_text(json.dumps(
+        {"today": today.isoformat(), "items": out}, ensure_ascii=False))
+
+
 def main():
     key = os.environ["DATA_GO_KR_KEY"]
     regions = [r.strip() for r in os.getenv("REGIONS", "").split(",") if r.strip()]
@@ -184,18 +218,24 @@ def main():
     since = today - timedelta(days=LOOKBACK_DAYS)
 
     sources = SOURCES + (OFFICETEL_SOURCES if os.getenv("INCLUDE_OFFICETEL") == "1" else [])
-    items = []
+    items, seoul = [], []
     for op, cat, schedule in sources:
         try:
             for row in fetch(op, key, since):
                 if region_ok(row, regions):
                     items.append((cat, row, schedule))
+                if region_ok(row, ["서울"]):
+                    seoul.append((cat, row, schedule))
         except Exception as e:  # 한 종류가 실패해도 나머지는 보냄
             print(f"[경고] {cat} 조회 실패: {e}", file=sys.stderr)
 
     first_run = not SEEN_FILE.exists()
     seen = set(json.loads(SEEN_FILE.read_text())) if not first_run else set()
     msg, has_content = build_message(items, today, seen, first_run)
+    site = site_url()
+    if site:
+        msg += f'\n🌐 <a href="{site}cheongyak.html">서울 청약 일정 페이지</a>'
+    save_seoul(seoul, today, seen, first_run)
 
     if dry:
         print(msg)

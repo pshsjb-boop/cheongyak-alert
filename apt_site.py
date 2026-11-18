@@ -188,7 +188,9 @@ def main():
                 "permits": permits, "perr": perr, "pfirst": pfirst, "pdays": PERMIT_DAYS}
         (DOCS / f"{slug}.html").write_text(render_gu(page), encoding="utf-8")
 
-    (DOCS / "index.html").write_text(render_index(summary, now, first_run), encoding="utf-8")
+    cy = load_cheongyak()
+    (DOCS / "cheongyak.html").write_text(render_cheongyak(cy, now), encoding="utf-8")
+    (DOCS / "index.html").write_text(render_index(summary, now, first_run, cy), encoding="utf-8")
     seen_path.write_text(json.dumps(new_seen, ensure_ascii=False))
     if new_pseen:
         pseen_path.write_text(json.dumps({**pseen, **new_pseen} if any(not s["permit_ok"] for s in summary) else new_pseen, ensure_ascii=False))
@@ -255,17 +257,49 @@ HEAD = ('<!doctype html><html lang="ko"><head><meta charset="utf-8">'
 
 
 def nav(active=""):
-    links = [f'<a href="index.html" class="{"on" if not active else ""}">전체</a>']
+    links = [f'<a href="index.html" class="{"on" if not active else ""}">전체</a>',
+             f'<a href="cheongyak.html" class="{"on" if active == "cheongyak" else ""}">청약</a>']
     links += [f'<a href="{s}.html" class="{"on" if s == active else ""}">{n}</a>' for _, n, s in GU]
     return '<nav class="gus">' + "".join(links) + "</nav>"
 
 
-def render_index(summary, now, first_run):
-    cards = "".join(
+def load_cheongyak():
+    p = DATA / "cheongyak_seoul.json"
+    return json.loads(p.read_text()) if p.exists() else None
+
+
+def cy_counts(cy, today):
+    if not cy:
+        return 0, 0, 0
+    t = today.isoformat()
+    week = (today + timedelta(days=7)).isoformat()
+    now_ = sum(any(s["b"] <= t <= s["e"] for s in it["sch"]) for it in cy["items"])
+    soon = sum(any(t < s["b"] <= week for s in it["sch"]) for it in cy["items"])
+    return now_, soon, sum(it["new"] for it in cy["items"])
+
+
+def render_cheongyak(cy, now):
+    data = json.dumps(cy or {"today": now.date().isoformat(), "items": []}, ensure_ascii=False).replace("</", "<\\/")
+    return (HEAD.replace("{title}", "서울 청약 일정 · 오늘의 부동산") +
+            f'<header><h1>서울 청약 일정</h1><span class="upd">{now:%Y-%m-%d %H:%M} 업데이트</span></header>'
+            + nav("cheongyak") +
+            '<div class="tabs"><button data-t="today" class="on">오늘·이번 주</button>'
+            '<button data-t="month">30일 일정</button><button data-t="list">공고 목록</button></div>'
+            '<div id="list"></div><p class="note">출처: 한국부동산원 청약홈 분양정보 (공고일 기준 최근 90일). '
+            '청약 전에는 반드시 청약홈 공고문을 확인하세요. '
+            '<a href="https://www.applyhome.co.kr/ai/aib/selectSubscrptCalenderView.do" style="text-decoration:underline">청약홈 캘린더</a></p>'
+            f'</div><script>const D={data};' + CY_JS + '</script></body></html>')
+
+
+def render_index(summary, now, first_run, cy=None):
+    c_now, c_soon, c_new = cy_counts(cy, now.date())
+    cards = (f'<a class="card" href="cheongyak.html"><h2>서울 청약</h2>'
+             f'<div class="big">{c_now}<span class="muted"> 건 오늘 일정</span></div>'
+             f'<div class="muted">7일 내 {c_soon} · 🆕새 공고 {c_new}</div></a>') + "".join(
         f'<a class="card" href="{s["slug"]}.html"><h2>{s["name"]}</h2>'
         f'<div class="big">{s["new"]}<span class="muted"> 건 신규</span></div>'
-        f'<div class="muted">🔺신고가 {s["high"]}건 · 최근 3개월 {s["recent"]:,}건</div>'
-        f'<div class="muted">🏷 토허 신규 {s["pnew"] if s["permit_ok"] else "-"}건 · 최근 {PERMIT_DAYS}일 {s["pall"]:,}건</div></a>'
+        f'<div class="muted">🔺신고가 {s["high"]} · 🏷토허 {s["pnew"] if s["permit_ok"] else "-"}</div>'
+        f'<div class="muted">3개월 거래 {s["recent"]:,} · 토허 {s["pall"]:,}</div></a>'
         for s in summary)
     first = '<p class="muted">첫 수집일이라 신규 건수는 내일부터 집계돼요.</p>' if first_run else ""
     return (HEAD.replace("{title}", "오늘의 부동산") +
@@ -289,6 +323,28 @@ def render_gu(page):
             '<div id="list"></div><p class="note">출처: 국토교통부 아파트 매매 실거래가, 서울부동산정보광장 토지거래허가 내역. 🔺신고가 = 같은 단지·같은 전용면적 직전 1년 최고가 경신. 토허 단지명은 지번으로 추정한 것이라 일부는 주소로만 표시돼요.</p>'
             f'</div><script>const D={data};' + JS + '</script></body></html>')
 
+
+CY_JS = r"""
+const $=s=>document.querySelector(s);let tab='today';const T=D.today;
+const add=(d,n)=>{const x=new Date(d+'T00:00:00');x.setDate(x.getDate()+n);return x.toISOString().slice(0,10)};
+const W='일월화수목금토';const fd=d=>{const x=new Date(d+'T00:00:00');return `${x.getMonth()+1}/${x.getDate()}(${W[x.getDay()]})`};
+const link=it=>it.url?`<a href="${it.url}" target="_blank" style="text-decoration:underline">${it.name}</a>`:it.name;
+const sub=it=>`${it.area?it.area+' · ':''}${it.cat}${it.supply?' · '+it.supply+'세대':''}${it.new?'<span class="tag nw">NEW</span>':''}`;
+function events(from,to){const ev=[];D.items.forEach(it=>it.sch.forEach(s=>{if(s.e>=from&&s.b<=to)ev.push({it,s})}));return ev.sort((a,b)=>a.s.b.localeCompare(b.s.b))}
+function evRow(x){const s=x.s,on=s.b<=T&&T<=s.e;return `<div class="row"><div><div class="n">${link(x.it)}</div><div class="m">${sub(x.it)}</div></div>
+<div class="p"><b style="font-size:14px">${s.label}</b><div class="m">${fd(s.b)}${s.e!==s.b?' ~ '+fd(s.e):''}</div>${on?'<div class="up">진행 중</div>':''}</div></div>`}
+function draw(){const L=$('#list');let h='';
+ if(tab==='today'){const a=events(T,T),b=events(add(T,1),add(T,7)).filter(x=>x.s.b>T);
+  h=`<div class="card" style="margin-bottom:12px"><b>📌 오늘</b>${a.map(evRow).join('')||'<div class="m" style="padding:8px 0">오늘 일정 없음</div>'}</div>
+  <div class="card"><b>🗓 앞으로 7일</b>${b.map(evRow).join('')||'<div class="m" style="padding:8px 0">일정 없음</div>'}</div>`}
+ else if(tab==='month'){const ev=events(T,add(T,30)).filter(x=>x.s.b>=T||x.s.e>=T);let last='';
+  ev.forEach(x=>{const d=x.s.b<T?T:x.s.b;if(d!==last){h+=`<div style="margin:14px 0 2px;font-weight:800">${fd(d)}</div>`;last=d}h+=evRow(x)});if(!h)h='<div class="empty">30일 안에 일정이 없어요.</div>'}
+ else{const it=[...D.items].sort((a,b)=>b.pub.localeCompare(a.pub));
+  h=it.map(i=>`<div class="card" style="margin-bottom:10px"><div class="n" style="font-weight:700">${link(i)}</div><div class="m">${sub(i)} · 공고 ${i.pub?fd(i.pub):'-'}</div><div class="m">${i.addr}</div>
+  <div style="margin-top:6px">${i.sch.map(s=>`<div class="m">• ${s.label}: ${fd(s.b)}${s.e!==s.b?' ~ '+fd(s.e):''}${s.e<T?' (지남)':''}</div>`).join('')}</div></div>`).join('')||'<div class="empty">최근 공고가 없어요.</div>'}
+ L.innerHTML=h}
+document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('on'));b.classList.add('on');tab=b.dataset.t;draw()});draw();
+"""
 
 JS = r"""
 const $=s=>document.querySelector(s);let tab='new';
