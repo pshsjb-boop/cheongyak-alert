@@ -26,6 +26,7 @@ GU = [  # (법정동코드, 이름, 페이지 주소)
 ]
 HISTORY_MONTHS = 13   # 신고가 비교용 (이번 달 포함 13개월)
 RECENT_MONTHS = 3     # 페이지에 보여 줄 기간
+RENT_LINES = 5        # 텔레그램에 구별로 보여 줄 전세·월세 건수
 
 
 def months_back(today, n):
@@ -232,6 +233,8 @@ def main():
         summary.append({"name": name, "slug": slug, "new": len(new), "high": len(highs),
                         "permit_ok": permits is not None, "pnew": len(pnew),
                         "jnew": sum(r["type"] == "전세" for r in rnew), "wnew": sum(r["type"] == "월세" for r in rnew),
+                        "jtop": sorted((r for r in rnew if r["type"] == "전세"), key=lambda r: -r["price"])[:RENT_LINES],
+                        "wtop": sorted((r for r in rnew if r["type"] == "월세"), key=lambda r: -r["rent"])[:RENT_LINES],
                         "pall": len(permits or []),
                         "ptop": sorted(top_apts.items(), key=lambda kv: -kv[1])[:3],
                         "cancel": sum(r["cancel"] for r in new), "recent": sum(r["type"] == "매매" for r in recent),
@@ -270,6 +273,15 @@ def telegram_text(summary, now, first_run, site):
         lines.append(f"\n📍 <b>{link}</b>  매매 {s['new']}건 · 🔺신고가 {s['high']}건{extra}")
         if s["jnew"] or s["wnew"]:
             lines.append(f"  🔑 전세 {s['jnew']}건 · 월세 {s['wnew']}건")
+        for r in s["jtop"] + s["wtop"]:
+            money = f"{eok(r['price'])} / {r['rent']:,}만" if r["type"] == "월세" else eok(r["price"])
+            prev = ""
+            if r["contract"] == "갱신" and r["pdep"]:
+                prev = f" (갱신·종전 {eok(r['pdep'])}" + (f" / {r['prent']:,}만" if r["prent"] else "") + ")"
+            elif r["contract"]:
+                prev = f" ({r['contract']})"
+            lines.append(f"  {'🟢전세' if r['type'] == '전세' else '🟠월세'} {html.escape(r['apt'])} {r['py']}㎡ "
+                         f"{r['floor']}층 <b>{money}</b>{prev}")
         if not s["permit_ok"]:
             lines.append("  🏷 토허 내역: 서울시 서버 연결 실패")
         elif s["pnew"] or not first_run:
