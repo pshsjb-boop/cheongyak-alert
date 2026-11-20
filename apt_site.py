@@ -19,6 +19,7 @@ KST = timezone(timedelta(hours=9))
 HERE = Path(__file__).parent
 DOCS, DATA = HERE / "docs", HERE / "data"
 URL = "https://apis.data.go.kr/1613000/RTMSDataSvcAptTrade/getRTMSDataSvcAptTrade"
+RENT_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcAptRent/getRTMSDataSvcAptRent"
 GU = [  # (법정동코드, 이름, 페이지 주소)
     ("11680", "강남구", "gangnam"), ("11650", "서초구", "seocho"),
     ("11710", "송파구", "songpa"), ("11170", "용산구", "yongsan"),
@@ -35,10 +36,10 @@ def months_back(today, n):
     return out
 
 
-def fetch(key, lawd, ymd):
+def fetch(key, lawd, ymd, url=URL):
     rows, page = [], 1
     while True:
-        r = requests.get(URL, params={"serviceKey": key, "LAWD_CD": lawd, "DEAL_YMD": ymd,
+        r = requests.get(url, params={"serviceKey": key, "LAWD_CD": lawd, "DEAL_YMD": ymd,
                                       "pageNo": page, "numOfRows": 1000}, timeout=30)
         r.raise_for_status()
         root = ET.fromstring(r.content)
@@ -90,10 +91,47 @@ def norm(t):
         "floor": t.get("floor", ""), "price": int((t.get("dealAmount") or "0").replace(",", "") or 0),
         "date": d, "year": t.get("buildYear", ""), "cancel": t.get("cdealType", "") == "O",
         "kind": t.get("dealingGbn", ""),
-        "key": f'{t.get("umdNm", "")} {t.get("jibun", "")}'.strip(),
+        "key": f'{t.get("umdNm", "")} {t.get("jibun", "")}'.strip(), "type": "매매",
     }
     row["id"] = "|".join(str(row[k]) for k in ("seq", "date", "floor", "area", "price"))
     return row
+
+
+def num(v):
+    try:
+        return int(str(v or "0").replace(",", "").strip() or 0)
+    except ValueError:
+        return 0
+
+
+def norm_rent(t):
+    try:
+        area = float(t.get("excluUseAr") or 0)
+        d = f"{int(t['dealYear'])}-{int(t['dealMonth']):02d}-{int(t['dealDay']):02d}"
+    except (KeyError, ValueError):
+        return None
+    dep, mon = num(t.get("deposit")), num(t.get("monthlyRent"))
+    row = {
+        "type": "월세" if mon else "전세", "apt": t.get("aptNm", ""), "dong": t.get("umdNm", ""),
+        "area": round(area, 2), "py": int(area), "floor": t.get("floor", ""), "date": d,
+        "year": t.get("buildYear", ""), "price": dep, "rent": mon, "cancel": False,
+        "contract": t.get("contractType", ""), "rr": t.get("useRRRight", ""),
+        "pdep": num(t.get("preDeposit")), "prent": num(t.get("preMonthlyRent")),
+        "key": f'{t.get("umdNm", "")} {t.get("jibun", "")}'.strip(),
+    }
+    row["id"] = "R|" + "|".join(str(row[k]) for k in ("apt", "date", "floor", "area", "price", "rent"))
+    return row
+
+
+def build_rent(key, lawd, today):
+    rows, failed = [], False
+    for ym in months_back(today, RECENT_MONTHS):
+        try:
+            rows += [x for x in map(norm_rent, fetch(key, lawd, ym, RENT_URL)) if x]
+        except Exception as e:
+            failed = True
+            print(f"[경고] {lawd} {ym} 전월세: {e}", file=sys.stderr)
+    return rows, failed
 
 
 def eok(manwon):
@@ -168,17 +206,22 @@ def main():
             print(f"[경고] {name} 토허 내역 조회 실패: {e}", file=sys.stderr)
             permits, perr = None, str(e)[:120]
         recent = [r for r in rows if r["date"] >= cutoff]
-        # 이 구를 처음 제대로 수집한 날은 기준일로만 저장 (전날 수집 실패 시 '신규 폭탄' 방지)
-        gu_base = first_run or lawd not in gu_done
-        if recent:
-            gu_done.add(lawd)
-        for r in recent:
-            sid = r["id"] + ("|X" if r["cancel"] else "")
-            r["seen"] = seen.get(sid) or ("base" if gu_base else today)
-            new_seen[sid] = r["seen"]
-            r["new"] = r["seen"] == today
+        rents, rent_failed = build_rent(key, lawd, now.date())
+        rents = [r for r in rents if r["date"] >= cutoff]
+        # 처음 제대로 수집한 날은 기준일로만 저장 (수집 실패 다음 날 '신규 폭탄' 방지)
+        for group, tag in ((recent, lawd), (rents, lawd + "R")):
+            gu_base = first_run or tag not in gu_done
+            if group and not (tag.endswith("R") and rent_failed):
+                gu_done.add(tag)
+            for r in group:
+                sid = r["id"] + ("|X" if r["cancel"] else "")
+                r["seen"] = seen.get(sid) or ("base" if gu_base else today)
+                new_seen[sid] = r["seen"]
+                r["new"] = r["seen"] == today
+        rnew = [r for r in rents if r["new"]]
+        recent = recent + rents
         recent.sort(key=lambda r: (r["date"], r["price"]), reverse=True)
-        new = [r for r in recent if r["new"]]
+        new = [r for r in recent if r["new"] and r["type"] == "매매"]
         highs = [r for r in new if r.get("high")]
         pnew = [p for p in (permits or []) if p["new"]]
         top_apts = {}
@@ -188,9 +231,10 @@ def main():
                 top_apts[label] = top_apts.get(label, 0) + 1
         summary.append({"name": name, "slug": slug, "new": len(new), "high": len(highs),
                         "permit_ok": permits is not None, "pnew": len(pnew),
+                        "jnew": sum(r["type"] == "전세" for r in rnew), "wnew": sum(r["type"] == "월세" for r in rnew),
                         "pall": len(permits or []),
                         "ptop": sorted(top_apts.items(), key=lambda kv: -kv[1])[:3],
-                        "cancel": sum(r["cancel"] for r in new), "recent": len(recent),
+                        "cancel": sum(r["cancel"] for r in new), "recent": sum(r["type"] == "매매" for r in recent),
                         "top": sorted(highs, key=lambda r: -r["price"])[:5]})
         page = {"gu": name, "slug": slug, "updated": now.strftime("%Y-%m-%d %H:%M"),
                 "first_run": first_run, "rows": recent,
@@ -223,7 +267,9 @@ def telegram_text(summary, now, first_run, site):
     for s in summary:
         link = f'<a href="{site}{s["slug"]}.html">{s["name"]}</a>' if site else s["name"]
         extra = f" · ❌해제 {s['cancel']}" if s["cancel"] else ""
-        lines.append(f"\n📍 <b>{link}</b>  신규 {s['new']}건 · 🔺신고가 {s['high']}건{extra}")
+        lines.append(f"\n📍 <b>{link}</b>  매매 {s['new']}건 · 🔺신고가 {s['high']}건{extra}")
+        if s["jnew"] or s["wnew"]:
+            lines.append(f"  🔑 전세 {s['jnew']}건 · 월세 {s['wnew']}건")
         if not s["permit_ok"]:
             lines.append("  🏷 토허 내역: 서울시 서버 연결 실패")
         elif s["pnew"] or not first_run:
@@ -251,11 +297,11 @@ h1{font-size:22px;margin:0;letter-spacing:-.02em}.upd{color:var(--sub);font-size
 .tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin:4px 0 10px;overflow-x:auto}
 .tabs button{border:0;background:none;padding:10px 12px;font:inherit;font-weight:600;color:var(--sub);border-bottom:2px solid transparent;white-space:nowrap;cursor:pointer}
 .tabs button.on{color:var(--ink);border-color:var(--ink)}
-.tools{display:flex;gap:8px;margin-bottom:10px}.tools input,.tools select{font:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:10px;background:#fff}.tools input{flex:1;min-width:0}
+.tools{display:flex;gap:6px;margin-bottom:10px}.tools input,.tools select{font:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:10px;background:#fff}.tools input{flex:1;min-width:0}
 .row{display:flex;justify-content:space-between;gap:10px;padding:12px 4px;border-bottom:1px solid var(--line)}
 .row .n{font-weight:700}.row .m{color:var(--sub);font-size:13px}.row .p{text-align:right;white-space:nowrap}.row .p b{font-size:16px}
 .tag{display:inline-block;font-size:11px;font-weight:700;padding:1px 6px;border-radius:6px;margin-left:4px;vertical-align:1px}
-.hi{background:#ffeceb;color:var(--red)}.cx{background:#eef0f3;color:var(--sub);text-decoration:line-through}.nw{background:#e8efff;color:var(--brand)}
+.hi{background:#ffeceb;color:var(--red)}.t-매매{background:#e8efff;color:var(--brand)}.t-전세{background:#e6f6ee;color:var(--green)}.t-월세{background:#fff1e0;color:#c26a00}.cx{background:#eef0f3;color:var(--sub);text-decoration:line-through}.nw{background:#e8efff;color:var(--brand)}
 .up{color:var(--red);font-size:12px}.empty{padding:40px 0;text-align:center;color:var(--sub)}
 .note{margin-top:18px;color:var(--sub);font-size:12px}
 """
@@ -307,7 +353,8 @@ def render_index(summary, now, first_run, cy=None):
              f'<div class="big">{c_now}<span class="muted"> 건 오늘 일정</span></div>'
              f'<div class="muted">7일 내 {c_soon} · 🆕새 공고 {c_new}</div></a>') + "".join(
         f'<a class="card" href="{s["slug"]}.html"><h2>{s["name"]}</h2>'
-        f'<div class="big">{s["new"]}<span class="muted"> 건 신규</span></div>'
+        f'<div class="big">{s["new"]}<span class="muted"> 건 매매 신규</span></div>'
+        f'<div class="muted">🔑 전세 {s["jnew"]} · 월세 {s["wnew"]}</div>'
         f'<div class="muted">🔺신고가 {s["high"]} · 🏷토허 {s["pnew"] if s["permit_ok"] else "-"}</div>'
         f'<div class="muted">3개월 거래 {s["recent"]:,} · 토허 {s["pall"]:,}</div></a>'
         for s in summary)
@@ -329,8 +376,9 @@ def render_gu(page):
             '<button data-t="high">오늘의 신고가</button><button data-t="all">최근 3개월</button>'
             '<button data-t="permit">토지거래허가</button></div>'
             '<div class="tools"><input id="q" placeholder="단지·동 이름 검색">'
+            '<select id="k"><option value="">전체</option><option>매매</option><option>전세</option><option>월세</option></select>'
             '<select id="s"><option value="date">계약일순</option><option value="price">가격순</option></select></div>'
-            '<div id="list"></div><p class="note">출처: 국토교통부 아파트 매매 실거래가, 서울부동산정보광장 토지거래허가 내역. 🔺신고가 = 같은 단지·같은 전용면적 직전 1년 최고가 경신. 토허 단지명은 지번으로 추정한 것이라 일부는 주소로만 표시돼요.</p>'
+            '<div id="list"></div><p class="note">출처: 국토교통부 아파트 매매·전월세 실거래가, 서울부동산정보광장 토지거래허가 내역. 🔺신고가 = 같은 단지·같은 전용면적 직전 1년 최고가 경신. 토허 단지명은 지번으로 추정한 것이라 일부는 주소로만 표시돼요.</p>'
             f'</div><script>const D={data};' + JS + '</script></body></html>')
 
 
@@ -361,14 +409,16 @@ const $=s=>document.querySelector(s);let tab='new';
 const eok=m=>{const e=Math.floor(m/1e4),r=m%1e4;return e&&r?`${e}억 ${r.toLocaleString()}`:e?`${e}억`:`${r.toLocaleString()}만`};
 function rows(){let r=D.rows;const q=$('#q').value.trim();
  if(tab==='new')r=r.filter(x=>x.new);if(tab==='high')r=r.filter(x=>x.high&&(x.new||D.first_run));
- if(q)r=r.filter(x=>(x.apt+x.dong).includes(q));
+ if(q)r=r.filter(x=>(x.apt+x.dong).includes(q));const k=$('#k').value;if(k)r=r.filter(x=>x.type===k);
  r=[...r].sort($('#s').value==='price'?(a,b)=>b.price-a.price:(a,b)=>b.date.localeCompare(a.date)||b.price-a.price);return r}
-function draw(){const L=$('#list');$('#s').style.display=tab==='permit'?'none':'';
+const money=x=>x.type==='월세'?`${eok(x.price)} / ${x.rent.toLocaleString()}만`:eok(x.price);
+const renew=x=>x.type==='매매'?'':(x.contract==='갱신'?`<div class="m">갱신${x.rr==='사용'?'(갱신권)':''}${x.pdep?` · 종전 ${x.prent?eok(x.pdep)+' / '+x.prent+'만':eok(x.pdep)}`:''}</div>`:(x.contract?`<div class="m">${x.contract}</div>`:''));
+function draw(){const L=$('#list');$('#s').style.display=$('#k').style.display=tab==='permit'?'none':'';
  if(tab==='permit'){drawPermit(L);return}
  const r=rows();if(!r.length){L.innerHTML=`<div class="empty">${tab==='new'&&D.first_run?'첫 수집일이라 내일부터 신규 거래가 표시돼요.':'해당 거래가 없어요.'}</div>`;return}
- L.innerHTML=r.slice(0,500).map(x=>`<div class="row"><div><div class="n">${x.apt}${x.high?'<span class="tag hi">신고가</span>':''}${x.cancel?'<span class="tag cx">해제</span>':''}${x.new&&tab==='all'?'<span class="tag nw">NEW</span>':''}</div>
+ L.innerHTML=r.slice(0,500).map(x=>`<div class="row"><div><div class="n"><span class="tag t-${x.type}" style="margin:0 4px 0 0">${x.type}</span>${x.apt}${x.high?'<span class="tag hi">신고가</span>':''}${x.cancel?'<span class="tag cx">해제</span>':''}${x.new&&tab==='all'?'<span class="tag nw">NEW</span>':''}</div>
  <div class="m">${x.dong} · 전용 ${x.area}㎡ · ${x.floor}층 · ${x.year}년식</div></div>
- <div class="p"><b>${eok(x.price)}</b><div class="m">${x.date.slice(2).replace(/-/g,'.')} 계약</div>${x.high&&x.prev?`<div class="up">▲ 직전 ${eok(x.prev)}</div>`:''}</div></div>`).join('')+(r.length>500?`<div class="empty">상위 500건만 표시</div>`:'')}
+ <div class="p"><b>${money(x)}</b><div class="m">${x.date.slice(2).replace(/-/g,'.')} 계약</div>${x.high&&x.prev?`<div class="up">▲ 직전 ${eok(x.prev)}</div>`:''}${renew(x)}</div></div>`).join('')+(r.length>500?`<div class="empty">상위 500건만 표시</div>`:'')}
 function drawPermit(L){const P=D.permits;
  if(!P){L.innerHTML=`<div class="empty">서울시 토지거래허가 서버에 연결하지 못했어요.<br><span class="m">${D.perr||''}</span></div>`;return}
  const q=$('#q').value.trim();let r=q?P.filter(x=>(x.apt+x.addr).includes(q)):P;
@@ -380,7 +430,7 @@ function drawPermit(L){const P=D.permits;
  <div style="margin-top:8px;font-weight:700">단지별 허가 TOP 10</div>${top.map(([k,v],i)=>`<div class="row" style="padding:8px 2px"><div>${i+1}. ${k}<div class="m">${v.addr}</div></div><div class="p"><b>${v.n}건</b>${v.t?`<div class="up">오늘 +${v.t}</div>`:''}</div></div>`).join('')||'<div class="m">없음</div>'}</div>`+
  r.slice(0,400).map(x=>`<div class="row"><div><div class="n">${x.apt||x.key}${tag(x)}${x.new?'<span class="tag nw">NEW</span>':''}</div><div class="m">${x.addr} · ${x.purpose} · 지목 ${x.jimok}</div></div><div class="p"><div class="m">${x.date.slice(2).replace(/-/g,'.')} 처리</div></div></div>`).join('')}
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('on'));b.classList.add('on');tab=b.dataset.t;draw()});
-$('#q').oninput=draw;$('#s').onchange=draw;draw();
+$('#q').oninput=draw;$('#s').onchange=draw;$('#k').onchange=draw;draw();
 """
 
 if __name__ == "__main__":
