@@ -116,7 +116,7 @@ def build_gu(key, lawd, today):
     for r in sorted(rows, key=lambda x: x["date"]):
         if r["cancel"]:
             continue
-        k = (r["seq"], r["py"])
+        k = (r["dong"], r["apt"], r["key"], r["py"])
         prev = best.get(k)
         r["high"] = prev is not None and r["price"] > prev
         r["prev"] = prev
@@ -136,6 +136,11 @@ def main():
     seen_path = DATA / "first_seen.json"
     first_run = not seen_path.exists()
     seen = {} if first_run else json.loads(seen_path.read_text())
+    done_path = DATA / "gu_done.json"
+    if done_path.exists():
+        gu_done = set(json.loads(done_path.read_text()))
+    else:  # 예전 버전에서 넘어온 경우: 이미 4개 구 모두 수집된 상태
+        gu_done = set() if first_run else {g[0] for g in GU}
 
     pseen_path = DATA / "permit_seen.json"
     pfirst = not pseen_path.exists()
@@ -164,7 +169,9 @@ def main():
             permits, perr = None, str(e)[:120]
         recent = [r for r in rows if r["date"] >= cutoff]
         # 이 구를 처음 제대로 수집한 날은 기준일로만 저장 (전날 수집 실패 시 '신규 폭탄' 방지)
-        gu_base = first_run or not any(k.startswith(lawd) for k in seen)
+        gu_base = first_run or lawd not in gu_done
+        if recent:
+            gu_done.add(lawd)
         for r in recent:
             sid = r["id"] + ("|X" if r["cancel"] else "")
             r["seen"] = seen.get(sid) or ("base" if gu_base else today)
@@ -194,6 +201,7 @@ def main():
     (DOCS / "cheongyak.html").write_text(render_cheongyak(cy, now), encoding="utf-8")
     (DOCS / "index.html").write_text(render_index(summary, now, first_run, cy), encoding="utf-8")
     seen_path.write_text(json.dumps(new_seen, ensure_ascii=False))
+    done_path.write_text(json.dumps(sorted(gu_done)))
     if new_pseen:
         pseen_path.write_text(json.dumps({**pseen, **new_pseen} if any(not s["permit_ok"] for s in summary) else new_pseen, ensure_ascii=False))
 
